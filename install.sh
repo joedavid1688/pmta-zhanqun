@@ -17,7 +17,7 @@
 #                   格式见 conf/ip_map.example.txt（支持 CIDR 段 / 起止段 / 指定域名）
 #
 # 重新生成配置（新增/删除 IP 后）:
-#   bash install.sh --reconfigure [ip_map_file]
+#   bash install.sh --reconfigure [ip_map_file] [domains_override]
 #
 # 可选环境变量:
 #   PMTA_INTERNAL_IP  内部监听 IP（dummy-smtp-ip），默认等于 main_ip
@@ -44,6 +44,13 @@ if [ "$RECONFIGURE" = "1" ]; then
   # shellcheck disable=SC1090
   . "$ARGS_FILE"
   IP_MAP="${1:-${IP_MAP:-./conf/ip_map.example.txt}}"
+  # 可选域名覆盖（站群同机新增域名时使用）
+  if [ -n "${2:-}" ]; then
+    DOMAINS="$2"
+    MAIN_DOMAIN=$(echo "$DOMAINS" | cut -d, -f1)
+    sed -i "s|^DOMAINS=.*|DOMAINS=\"$DOMAINS\"|" "$ARGS_FILE"
+    sed -i "s|^MAIN_DOMAIN=.*|MAIN_DOMAIN=\"$MAIN_DOMAIN\"|" "$ARGS_FILE"
+  fi
 else
   if [ $# -lt 7 ]; then
     echo "用法: bash install.sh <domains> <main_ip> <password> <dkim_selector> <panel_port|0> <tls:yes|no> <email_prefix> [ip_map_file]"
@@ -169,11 +176,16 @@ sed -i 's/\r$//' bind_ips.sh gen_config.py
 bash bind_ips.sh "$IP_MAP" "$MAIN_IP"
 
 # ======================== 生成 PMTA 配置 ========================
+# 剔除绑定失败的 IP（bind_result.txt 中 FAILED 的行不会写进配置）
+BIND_RESULT_ARGS="-"
+if [ -f /etc/pmta/bind_result.txt ]; then
+  BIND_RESULT_ARGS="/etc/pmta/bind_result.txt"
+fi
 echo "[STEP] 生成 /etc/pmta/config"
 python3 gen_config.py \
   "$DOMAINS" "$MAIN_IP" "$INTERNAL_IP" "$PASSWORD" \
   "$DKIM_SELECTOR" "$PANEL_PORT" "$USE_TLS" "$EMAIL_PREFIX" \
-  "$IP_MAP" "$CONFIG_TEMPLATE" /etc/pmta/config
+  "$IP_MAP" "$CONFIG_TEMPLATE" /etc/pmta/config "$BIND_RESULT_ARGS"
 
 # Panel 开关
 if [ "$PANEL_PORT" = "0" ]; then

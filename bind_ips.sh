@@ -49,7 +49,7 @@ fi
 PREFIX_LEN=$(ip -4 -o addr show dev "$IFACE" scope global | grep -F " $MAIN_IP/" | head -1 | awk '{print $4}' | cut -d/ -f2)
 PREFIX_LEN="${PREFIX_LEN:-24}"
 
-# ---------- 展开 IP 列表（python3 处理 CIDR / 起止段） ----------
+# ---------- 展开 IP 列表（python3 处理 CIDR / 起止段 / 简写段） ----------
 EXPAND_PY='
 import sys
 entries = []
@@ -63,9 +63,16 @@ for line in open(sys.argv[1], encoding="utf-8"):
         import ipaddress
         if "-" in line and "/" not in line:
             s, e = line.split("-", 1)
-            a, b = int(ipaddress.ip_address(s.strip())), int(ipaddress.ip_address(e.strip()))
-            while a <= b:
-                entries.append(str(ipaddress.ip_address(a))); a += 1
+            s = s.strip(); e = e.strip()
+            a = ipaddress.ip_address(s)
+            if e.isdigit():
+                # 简写段：109.66.77.2-254 → 末位补全
+                b = ipaddress.ip_address(".".join(str(a).split(".")[:3]) + "." + e)
+            else:
+                b = ipaddress.ip_address(e)
+            cur = int(a)
+            while cur <= int(b):
+                entries.append(str(ipaddress.ip_address(cur))); cur += 1
         elif "/" in line:
             net = ipaddress.ip_network(line, strict=False)
             for ip in net.hosts() if net.prefixlen < 32 else [net.network_address]:
@@ -74,7 +81,17 @@ for line in open(sys.argv[1], encoding="utf-8"):
             entries.append(str(ipaddress.ip_address(line)))
     except ValueError as e:
         print("skip %s: %s" % (line, e), file=sys.stderr)
-print("\n".join(entries))
+# 多行展开结果去重，剔除 .0/.255（单 IP 显式输入不剔除，这里统一按段处理）
+seen = set()
+out = []
+for ip in entries:
+    if ip in seen:
+        continue
+    seen.add(ip)
+    if (ip.endswith(".0") or ip.endswith(".255")) and len(entries) > 1:
+        continue
+    out.append(ip)
+print("\n".join(out))
 '
 IP_LIST=$(python3 -c "$EXPAND_PY" "$IP_MAP" | sort -u) || { echo "[ERR] IP 列表解析失败"; exit 1; }
 [ -n "$IP_LIST" ] || { echo "[ERR] IP 列表为空"; exit 1; }
@@ -85,15 +102,20 @@ SKIPPED=0
 FAILED=0
 
 echo "[STEP] 绑定 IP（网卡 $IFACE，共 $TOTAL 个）"
+BIND_RESULT="/etc/pmta/bind_result.txt"
+mkdir -p /etc/pmta
+: > "$BIND_RESULT"
 for ip in $IP_LIST; do
   # 主 IP 本身已绑定，跳过
   if [ "$ip" = "$MAIN_IP" ]; then
     echo "  [SKIP] $ip (主 IP)"
+    echo "BOUND $ip" >> "$BIND_RESULT"
     SKIPPED=$((SKIPPED+1))
     continue
   fi
   if ip -4 addr show dev "$IFACE" | grep -qF " ${ip}/"; then
     echo "  [SKIP] $ip (已绑定)"
+    echo "BOUND $ip" >> "$BIND_RESULT"
     SKIPPED=$((SKIPPED+1))
     continue
   fi
@@ -102,9 +124,11 @@ for ip in $IP_LIST; do
      || ip addr add "${ip}/32" dev "$IFACE" 2>/dev/null; then
     ip route replace "${ip}/32" dev "$IFACE" src "$ip" 2>/dev/null || true
     echo "  [OK]   $ip"
+    echo "BOUND $ip" >> "$BIND_RESULT"
     BOUND=$((BOUND+1))
   else
     echo "  [FAIL] $ip"
+    echo "FAILED $ip" >> "$BIND_RESULT"
     FAILED=$((FAILED+1))
   fi
 done
@@ -139,6 +163,11 @@ echo
 echo "======================================================"
 echo "[DONE] 绑定完成: 新增 $BOUND / 跳过 $SKIPPED / 失败 $FAILED"
 echo "[INFO] IP 列表已存至 /etc/pmta/ip_map.txt"
+echo "[INFO] 绑定结果明细: $BIND_RESULT（BOUND/FAILED 逐行）"
 echo "[INFO] 开机自动绑定服务: pmta-bind-ip.service"
-[ "$FAILED" -gt 0 ] && { echo "[WARN] 有 $FAILED 个 IP 绑定失败，请检查网卡/子网配置"; exit 1; }
+if [ "$FAILED" -gt 0 ]; then
+  echo "[WARN] 有 $FAILED 个 IP 绑定失败（可能机房未路由到本机），"
+  echo "[WARN] 失败 IP 不会写进 PMTA 配置，请与机房确认后重跑本脚本。"
+fi
 echo "======================================================"
+exit 0

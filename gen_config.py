@@ -10,7 +10,7 @@ pmta-zhanqun - PMTA 站群配置生成器
 用法:
     python3 gen_config.py <domains> <main_ip> <internal_ip> <password> \
         <dkim_selector> <panel_port> <use_tls> <email_prefix> \
-        <ip_map_file> <template> <output>
+        <ip_map_file> <template> <output> [bind_result_file|-]
 
 domains      : 逗号分隔的域名列表，如 "a.com,b.com"（主域排第一）
 main_ip      : 服务器主 IP（本身已绑定，不重复绑定，但会生成 vmta）
@@ -23,6 +23,8 @@ email_prefix : 邮箱前缀，如 "mail"
 ip_map_file  : IP 列表（参考 conf/ip_map.example.txt）
 template     : conf/config 模板路径
 output       : 输出 /etc/pmta/config
+bind_result_file: bind_ips.sh 生成的 /etc/pmta/bind_result.txt，
+                  其中的 FAILED IP 会被剔除不写进配置（传 - 跳过）
 """
 import ipaddress
 import re
@@ -55,15 +57,27 @@ def read_ip_map(path):
 
 
 def expand_entry(text, domain_override):
-    """把一行 IP 条目展开为 [(ip_str, domain), ...] 列表。"""
+    """把一行 IP 条目展开为 [(ip_str, domain), ...] 列表。
+
+    支持 109.66.77.2-254 简写段（末位补全起 IP 前三段）。
+    """
     result = []
     domain = domain_override
     try:
         if "-" in text and "/" not in text:
             start, end = text.split("-", 1)
-            start_ip = ipaddress.ip_address(start.strip())
-            end_ip = ipaddress.ip_address(end.strip())
-            if start_ip.version != 4 or end_ip.version != 4:
+            start = start.strip()
+            end = end.strip()
+            start_ip = ipaddress.ip_address(start)
+            if start_ip.version != 4:
+                raise ValueError("只支持 IPv4: %s" % text)
+            if end.isdigit():
+                # 简写段：109.66.77.2-254 → 109.66.77.2 ~ 109.66.77.254
+                end_ip = ipaddress.ip_address(
+                    ".".join(str(start_ip).split(".")[:3]) + "." + end)
+            else:
+                end_ip = ipaddress.ip_address(end)
+            if end_ip.version != 4:
                 raise ValueError("只支持 IPv4: %s" % text)
             cur = int(start_ip)
             while cur <= int(end_ip):
@@ -102,8 +116,13 @@ def source_name(domain):
     return "source_" + re.sub(r"[^a-z0-9]+", "_", domain.lower()).strip("_")
 
 
-def build_blocks(domain_ips, selector, dkim_dir="/etc/pmta/dkim"):
+def build_blocks(domain_ips, selector, main_ip, dkim_dir="/etc/pmta/dkim"):
     """生成 <virtual-mta> / <virtual-mta-group> / <source> / <smtp-user> 块。
+
+    host-name 规则（与面板 CF DNS 记录一一对应）:
+        - 域名只有 1 个 IP，或 IP 为主 IP → host-name = 域名（根 A 记录覆盖）
+        - 其余 → host-name = <IP去点变横杠>.<域名>（每 IP 一条 A 记录，如
+          109-66-77-2.a.com），HELO/A/PTR 三点对齐
 
     返回 dict: vmtas / groups / pool / sources / users 文本。
     """
@@ -120,11 +139,12 @@ def build_blocks(domain_ips, selector, dkim_dir="/etc/pmta/dkim"):
         group_lines.append("<virtual-mta-group %s>" % grp)
         for ip in ips:
             name = vmta_name(domain, ip)
+            hostname = domain if (len(ips) == 1 or ip == main_ip) else ip.replace(".", "-") + "." + domain
             group_lines.append("    virtual-mta %s" % name)
             pool_lines.append("virtual-mta %s" % name)
             vmta_lines.append("<virtual-mta %s>" % name)
-            vmta_lines.append("    smtp-source-host %s %s" % (ip, domain))
-            vmta_lines.append("    host-name %s" % domain)
+            vmta_lines.append("    smtp-source-host %s %s" % (ip, hostname))
+            vmta_lines.append("    host-name %s" % hostname)
             vmta_lines.append("    domain-key %s,%s,%s/%s.pem" % (selector, domain, dkim_dir, domain))
             vmta_lines.append("</virtual-mta>")
             vmta_lines.append("")
@@ -169,11 +189,12 @@ def build_pattern_list(domains):
 
 def main():
     global PASSWORD, EMAIL_PREFIX
-    if len(sys.argv) != 12:
+    if len(sys.argv) != 13:
         print(__doc__)
         sys.exit(1)
     (_, domains_arg, main_ip, internal_ip, password, selector,
-     panel_port, use_tls, email_prefix, ip_map_file, template, output) = sys.argv
+     panel_port, use_tls, email_prefix, ip_map_file, template, output,
+     bind_result_file) = sys.argv
 
     PASSWORD = password
     EMAIL_PREFIX = email_prefix
@@ -182,6 +203,22 @@ def main():
     if not domains:
         print("[ERR] 至少需要 1 个域名")
         sys.exit(1)
+
+    # 绑定结果过滤：bind_result.txt 中 FAILED 的 IP 不写进配置
+    # （机房未路由到本机的 IP 出站必然失败，宁可少配不可错配）
+    failed_bound = set()
+    if bind_result_file and bind_result_file != "-":
+        try:
+            with open(bind_result_file, encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0] == "FAILED":
+                        failed_bound.add(parts[1])
+        except OSError:
+            pass
+    if failed_bound:
+        print("[WARN] %d 个 IP 绑定失败，已从配置剔除: %s" %
+              (len(failed_bound), ",".join(sorted(failed_bound)[:10])), file=sys.stderr)
 
     # IP 收集：主 IP 固定归主域；列表中显式指定域名的按指定归属，
     # 其余 IP 按域名轮询分配。
@@ -193,6 +230,8 @@ def main():
         flat.extend(expand_entry(text, override))
     for ip, domain in flat:
         if ip == main_ip:
+            continue
+        if ip in failed_bound:
             continue
         if ip in all_ips:
             print("[WARN] 重复 IP %s，忽略" % ip, file=sys.stderr)
@@ -209,7 +248,7 @@ def main():
     for i, ip in enumerate(unassigned):
         buckets[domains[i % len(domains)]].append(ip)
 
-    blocks = build_blocks(buckets, selector)
+    blocks = build_blocks(buckets, selector, main_ip)
 
     with open(template, encoding="utf-8") as f:
         content = f.read()
