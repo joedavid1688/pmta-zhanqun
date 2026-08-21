@@ -98,6 +98,13 @@ detect_os() {
 }
 
 pkg_install_debian() {
+  # 修复镜像已知坑：btrfs initramfs hook 硬编码老库 /lib/libgcrypt.so.11.8.9
+  # （24.04 不存在），内核包 postinst 重建 initramfs 失败导致 dpkg 返回 1
+  if [ -f /usr/share/initramfs-tools/hooks/btrfs ]; then
+    sed -i 's|^.*libgcrypt\.so\.11.*$|# panel-fix: removed hardcoded legacy libgcrypt11 path|' \
+      /usr/share/initramfs-tools/hooks/btrfs
+  fi
+  dpkg --configure -a >/dev/null 2>&1 || true
   apt-get update
   apt-get install -y --no-install-recommends \
     git wget unzip opendkim opendkim-tools \
