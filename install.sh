@@ -103,12 +103,19 @@ pkg_install_debian() {
   # 该库 → initramfs 生成失败 → 内核包 postinst 失败 → dpkg 返回 1。
   # 处理策略：根分区非 btrfs → 整个 hook 移走（ext4/xfs 用不到）；
   # 根分区是 btrfs → 临时移走 hook 修复内核包后装新版 btrfs-progs 再还原。
+  # 清理历史遗留的 .disabled 改名（同样在 hooks 目录内会被执行）
+  for _f in btrfs.disabled btrfs.disabled-by-panel; do
+    [ -f "/usr/share/initramfs-tools/hooks/$_f" ] && \
+      mv "/usr/share/initramfs-tools/hooks/$_f" "/usr/share/initramfs-tools/$_f.moved"
+  done
   if [ -f /usr/share/initramfs-tools/hooks/btrfs ]; then
     sed -i 's|^.*libgcrypt\.so\.11.*$|# panel-fix: removed hardcoded legacy libgcrypt11 path|' \
       /usr/share/initramfs-tools/hooks/btrfs
     if [ "$(stat -f -c %T /)" != "btrfs" ]; then
+      # 必须移出 hooks 目录：initramfs-tools 执行目录内所有文件，
+      # 改后缀 .disabled 同样会被执行
       mv /usr/share/initramfs-tools/hooks/btrfs \
-        /usr/share/initramfs-tools/hooks/btrfs.disabled-by-panel
+        /usr/share/initramfs-tools/btrfs.hook.disabled-by-panel
     else
       mv /usr/share/initramfs-tools/hooks/btrfs /tmp/btrfs.hook.bak
       dpkg --configure -a >/dev/null 2>&1 || true
