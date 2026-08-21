@@ -98,16 +98,22 @@ detect_os() {
 }
 
 pkg_install_debian() {
-  # 修复镜像已知坑：定制镜像的 btrfs initramfs hook 硬编码老库
-  # /lib/libgcrypt.so.11.8.9（24.04 不存在），内核包 postinst 重建
-  # initramfs 失败导致 dpkg 返回 1。先注释废弃行；根分区不是 btrfs
-  # 则整个 hook 移走（ext4/xfs 机器用不到它）。
+  # 修复镜像已知坑：定制镜像打包的 /usr/bin/btrfs 是旧版编译、动态链接
+  # libgcrypt.so.11（24.04 不存在），copy_exec 按 ldd 依赖拷贝时找不到
+  # 该库 → initramfs 生成失败 → 内核包 postinst 失败 → dpkg 返回 1。
+  # 处理策略：根分区非 btrfs → 整个 hook 移走（ext4/xfs 用不到）；
+  # 根分区是 btrfs → 临时移走 hook 修复内核包后装新版 btrfs-progs 再还原。
   if [ -f /usr/share/initramfs-tools/hooks/btrfs ]; then
     sed -i 's|^.*libgcrypt\.so\.11.*$|# panel-fix: removed hardcoded legacy libgcrypt11 path|' \
       /usr/share/initramfs-tools/hooks/btrfs
     if [ "$(stat -f -c %T /)" != "btrfs" ]; then
       mv /usr/share/initramfs-tools/hooks/btrfs \
         /usr/share/initramfs-tools/hooks/btrfs.disabled-by-panel
+    else
+      mv /usr/share/initramfs-tools/hooks/btrfs /tmp/btrfs.hook.bak
+      dpkg --configure -a >/dev/null 2>&1 || true
+      apt-get install -y --no-install-recommends btrfs-progs >/dev/null 2>&1 || true
+      mv /tmp/btrfs.hook.bak /usr/share/initramfs-tools/hooks/btrfs
     fi
   fi
   dpkg --configure -a >/dev/null 2>&1 || true
