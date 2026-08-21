@@ -111,13 +111,18 @@ pkg_install_debian() {
   done
 
   ZQ_LIB_OK=0
+  # 镜像旧二进制的 ldd 报错路径是字面量 /lib/libgcrypt.so.11.8.9，
+  # 必须以该精确文件名落盘（deb 内实际版本可能是 .11.8.2 等），
+  # find 定位真实文件名，两个路径都拷贝
   if ! ldconfig -p 2>/dev/null | grep -q 'libgcrypt\.so\.11'; then
     _zq_tmp=$(mktemp -d)
     ( wget -q -O "$_zq_tmp/libgcrypt11.deb" \
         'http://archive.ubuntu.com/ubuntu/pool/main/libg/libgcrypt11/libgcrypt11_1.5.3-2ubuntu4.6_amd64.deb' \
       && dpkg-deb -x "$_zq_tmp/libgcrypt11.deb" "$_zq_tmp/x" \
-      && cp -a "$_zq_tmp"/x/lib/x86_64-linux-gnu/libgcrypt.so.11* /lib/x86_64-linux-gnu/ \
-      && cp -a "$_zq_tmp"/x/lib/x86_64-linux-gnu/libgcrypt.so.11.8.9 /lib/libgcrypt.so.11.8.9 \
+      && _zq_lib=$(find "$_zq_tmp/x" -name 'libgcrypt.so.11.*' -type f | head -1) \
+      && [ -n "$_zq_lib" ] \
+      && cp -a "$_zq_lib" /lib/x86_64-linux-gnu/ \
+      && cp -a "$_zq_lib" /lib/libgcrypt.so.11.8.9 \
       && ldconfig ) && ZQ_LIB_OK=1 || ZQ_LIB_OK=0
     rm -rf "$_zq_tmp"
   fi
