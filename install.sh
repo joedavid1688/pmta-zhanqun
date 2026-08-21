@@ -98,11 +98,17 @@ detect_os() {
 }
 
 pkg_install_debian() {
-  # 修复镜像已知坑：btrfs initramfs hook 硬编码老库 /lib/libgcrypt.so.11.8.9
-  # （24.04 不存在），内核包 postinst 重建 initramfs 失败导致 dpkg 返回 1
+  # 修复镜像已知坑：定制镜像的 btrfs initramfs hook 硬编码老库
+  # /lib/libgcrypt.so.11.8.9（24.04 不存在），内核包 postinst 重建
+  # initramfs 失败导致 dpkg 返回 1。先注释废弃行；根分区不是 btrfs
+  # 则整个 hook 移走（ext4/xfs 机器用不到它）。
   if [ -f /usr/share/initramfs-tools/hooks/btrfs ]; then
     sed -i 's|^.*libgcrypt\.so\.11.*$|# panel-fix: removed hardcoded legacy libgcrypt11 path|' \
       /usr/share/initramfs-tools/hooks/btrfs
+    if [ "$(stat -f -c %T /)" != "btrfs" ]; then
+      mv /usr/share/initramfs-tools/hooks/btrfs \
+        /usr/share/initramfs-tools/hooks/btrfs.disabled-by-panel
+    fi
   fi
   dpkg --configure -a >/dev/null 2>&1 || true
   apt-get update
