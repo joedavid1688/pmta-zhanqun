@@ -98,36 +98,51 @@ detect_os() {
 }
 
 pkg_install_debian() {
-  # 修复镜像已知坑：定制镜像打包的 /usr/bin/btrfs 是旧版编译、动态链接
-  # libgcrypt.so.11（24.04 不存在），copy_exec 按 ldd 依赖拷贝时找不到
-  # 该库 → initramfs 生成失败 → 内核包 postinst 失败 → dpkg 返回 1。
-  # 处理策略：根分区非 btrfs → 整个 hook 移走（ext4/xfs 用不到）；
-  # 根分区是 btrfs → 临时移走 hook 修复内核包后装新版 btrfs-progs 再还原。
-  # 清理历史遗留的 .disabled 改名（同样在 hooks 目录内会被执行）
-  for _f in btrfs.disabled btrfs.disabled-by-panel; do
+  # ===== 镜像已知坑修复（幂等，正常系统上均为 no-op）=====
+  # 部分站群镜像打包的旧版二进制（btrfs/dhcpcd 等）动态链接
+  # libgcrypt.so.11（24.04 不存在），copy_exec 按 ldd 拷库失败
+  # → initramfs 生成失败 → 内核包 postinst 失败 → dpkg 返回 1。
+  # 策略：1) 移走已知坏 hook（必须移出 hooks 目录，改后缀无效）
+  #       2) 清理 .disabled 历史遗留
+  #       3) 临时 update_initramfs=no 防止其它未知坏 hook 再卡 dpkg
+  #       4) 安装完成后恢复配置，为已装内核补生成 initrd
+  for _f in btrfs.disabled btrfs.disabled-by-panel dhcpcd.disabled; do
     [ -f "/usr/share/initramfs-tools/hooks/$_f" ] && \
       mv "/usr/share/initramfs-tools/hooks/$_f" "/usr/share/initramfs-tools/$_f.moved"
   done
-  if [ -f /usr/share/initramfs-tools/hooks/btrfs ]; then
-    sed -i 's|^.*libgcrypt\.so\.11.*$|# panel-fix: removed hardcoded legacy libgcrypt11 path|' \
-      /usr/share/initramfs-tools/hooks/btrfs
-    if [ "$(stat -f -c %T /)" != "btrfs" ]; then
-      # 必须移出 hooks 目录：initramfs-tools 执行目录内所有文件，
-      # 改后缀 .disabled 同样会被执行
-      mv /usr/share/initramfs-tools/hooks/btrfs \
-        /usr/share/initramfs-tools/btrfs.hook.disabled-by-panel
-    else
-      mv /usr/share/initramfs-tools/hooks/btrfs /tmp/btrfs.hook.bak
-      dpkg --configure -a >/dev/null 2>&1 || true
-      apt-get install -y --no-install-recommends btrfs-progs >/dev/null 2>&1 || true
-      mv /tmp/btrfs.hook.bak /usr/share/initramfs-tools/hooks/btrfs
-    fi
+  for _h in btrfs dhcpcd; do
+    [ -f "/usr/share/initramfs-tools/hooks/$_h" ] && \
+      mv "/usr/share/initramfs-tools/hooks/$_h" \
+      "/usr/share/initramfs-tools/$_h.hook.disabled-by-panel"
+  done
+  ZQ_TOGGLED=0
+  if [ -f /etc/initramfs-tools/update-initramfs.conf ] && \
+     grep -q '^update_initramfs=yes' /etc/initramfs-tools/update-initramfs.conf; then
+    cp -a /etc/initramfs-tools/update-initramfs.conf \
+      /etc/initramfs-tools/update-initramfs.conf.panel-bak
+    sed -i 's/^update_initramfs=yes/update_initramfs=no/' \
+      /etc/initramfs-tools/update-initramfs.conf
+    ZQ_TOGGLED=1
   fi
+
   dpkg --configure -a >/dev/null 2>&1 || true
   apt-get update
-  apt-get install -y --no-install-recommends \
-    git wget unzip opendkim opendkim-tools \
-    python3 iproute2 curl ca-certificates net-tools openssl
+
+  local rc=0
+  ( apt-get install -y --no-install-recommends \
+      git wget unzip opendkim opendkim-tools \
+      python3 iproute2 curl ca-certificates net-tools openssl \
+    || ( apt-get install -f -y && apt-get install -y --no-install-recommends \
+      git wget unzip opendkim opendkim-tools \
+      python3 iproute2 curl ca-certificates net-tools openssl ) ) || rc=$?
+
+  # 恢复 initramfs 配置并补生成 initrd（坏 hook 已移走，可正常生成）
+  if [ "$ZQ_TOGGLED" = "1" ]; then
+    mv -f /etc/initramfs-tools/update-initramfs.conf.panel-bak \
+      /etc/initramfs-tools/update-initramfs.conf
+    update-initramfs -u -k all >/dev/null 2>&1 || true
+  fi
+  return $rc
 }
 
 pkg_install_redhat() {
