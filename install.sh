@@ -127,21 +127,12 @@ pkg_install_debian() {
     rm -rf "$_zq_tmp"
   fi
 
-  ZQ_TOGGLED=0
-  if [ "$ZQ_LIB_OK" != "1" ]; then
-    for _h in btrfs dhcpcd fsck; do
-      [ -f "/usr/share/initramfs-tools/hooks/$_h" ] && \
-        mv "/usr/share/initramfs-tools/hooks/$_h" \
-        "/usr/share/initramfs-tools/$_h.hook.disabled-by-panel"
-    done
-    if [ -f /etc/initramfs-tools/update-initramfs.conf ] && \
-       grep -q '^update_initramfs=yes' /etc/initramfs-tools/update-initramfs.conf; then
-      cp -a /etc/initramfs-tools/update-initramfs.conf \
-        /etc/initramfs-tools/update-initramfs.conf.panel-bak
-      sed -i 's/^update_initramfs=yes/update_initramfs=no/' \
-        /etc/initramfs-tools/update-initramfs.conf
-      ZQ_TOGGLED=1
-    fi
+  # 兜底（与库是否装成功无关）：临时移走内核 postinst 的 initramfs
+  # 触发器，保证 dpkg 配置内核包必定成功，不再受未知坏 hook 影响
+  ZQ_TRIG=0
+  if [ -f /etc/kernel/postinst.d/initramfs-tools ]; then
+    mv /etc/kernel/postinst.d/initramfs-tools /etc/kernel/postinst.d/initramfs-tools.panel-bak
+    ZQ_TRIG=1
   fi
 
   dpkg --configure -a >/dev/null 2>&1 || true
@@ -155,12 +146,13 @@ pkg_install_debian() {
       git wget unzip opendkim opendkim-tools \
       python3 iproute2 curl ca-certificates net-tools openssl ) ) || rc=$?
 
-  # 恢复 initramfs 配置并补生成 initrd
-  if [ "$ZQ_TOGGLED" = "1" ]; then
-    mv -f /etc/initramfs-tools/update-initramfs.conf.panel-bak \
-      /etc/initramfs-tools/update-initramfs.conf
-    update-initramfs -u -k all >/dev/null 2>&1 || true
+  # 恢复触发器并尽力补生成 initrd（库补上后 hook 正常，能成功；
+  # 失败也不影响 dpkg 已完成的配置状态）
+  if [ "$ZQ_TRIG" = "1" ]; then
+    mv -f /etc/kernel/postinst.d/initramfs-tools.panel-bak \
+      /etc/kernel/postinst.d/initramfs-tools
   fi
+  update-initramfs -u -k all >/dev/null 2>&1 || true
   return $rc
 }
 
