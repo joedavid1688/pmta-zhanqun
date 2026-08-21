@@ -99,30 +99,44 @@ detect_os() {
 
 pkg_install_debian() {
   # ===== 镜像已知坑修复（幂等，正常系统上均为 no-op）=====
-  # 部分站群镜像打包的旧版二进制（btrfs/dhcpcd 等）动态链接
+  # 部分站群镜像打包的旧版二进制（btrfs/dhcpcd/fsck 等）动态链接
   # libgcrypt.so.11（24.04 不存在），copy_exec 按 ldd 拷库失败
   # → initramfs 生成失败 → 内核包 postinst 失败 → dpkg 返回 1。
-  # 策略：1) 移走已知坏 hook（必须移出 hooks 目录，改后缀无效）
-  #       2) 清理 .disabled 历史遗留
-  #       3) 临时 update_initramfs=no 防止其它未知坏 hook 再卡 dpkg
-  #       4) 安装完成后恢复配置，为已装内核补生成 initrd
+  # 主修复：补装 libgcrypt11（trusty 归档），一次解决所有 hook；
+  # 兜底：库下载失败才移走已知坏 hook + 临时关 initramfs 生成。
+  # 清理 .disabled 历史遗留（hooks 目录内所有文件都会被执行）
   for _f in btrfs.disabled btrfs.disabled-by-panel dhcpcd.disabled; do
     [ -f "/usr/share/initramfs-tools/hooks/$_f" ] && \
       mv "/usr/share/initramfs-tools/hooks/$_f" "/usr/share/initramfs-tools/$_f.moved"
   done
-  for _h in btrfs dhcpcd; do
-    [ -f "/usr/share/initramfs-tools/hooks/$_h" ] && \
-      mv "/usr/share/initramfs-tools/hooks/$_h" \
-      "/usr/share/initramfs-tools/$_h.hook.disabled-by-panel"
-  done
+
+  ZQ_LIB_OK=0
+  if ! ldconfig -p 2>/dev/null | grep -q 'libgcrypt\.so\.11'; then
+    _zq_tmp=$(mktemp -d)
+    ( wget -q -O "$_zq_tmp/libgcrypt11.deb" \
+        'http://archive.ubuntu.com/ubuntu/pool/main/libg/libgcrypt11/libgcrypt11_1.5.3-2ubuntu4.6_amd64.deb' \
+      && dpkg-deb -x "$_zq_tmp/libgcrypt11.deb" "$_zq_tmp/x" \
+      && cp -a "$_zq_tmp"/x/lib/x86_64-linux-gnu/libgcrypt.so.11* /lib/x86_64-linux-gnu/ \
+      && cp -a "$_zq_tmp"/x/lib/x86_64-linux-gnu/libgcrypt.so.11.8.9 /lib/libgcrypt.so.11.8.9 \
+      && ldconfig ) && ZQ_LIB_OK=1 || ZQ_LIB_OK=0
+    rm -rf "$_zq_tmp"
+  fi
+
   ZQ_TOGGLED=0
-  if [ -f /etc/initramfs-tools/update-initramfs.conf ] && \
-     grep -q '^update_initramfs=yes' /etc/initramfs-tools/update-initramfs.conf; then
-    cp -a /etc/initramfs-tools/update-initramfs.conf \
-      /etc/initramfs-tools/update-initramfs.conf.panel-bak
-    sed -i 's/^update_initramfs=yes/update_initramfs=no/' \
-      /etc/initramfs-tools/update-initramfs.conf
-    ZQ_TOGGLED=1
+  if [ "$ZQ_LIB_OK" != "1" ]; then
+    for _h in btrfs dhcpcd fsck; do
+      [ -f "/usr/share/initramfs-tools/hooks/$_h" ] && \
+        mv "/usr/share/initramfs-tools/hooks/$_h" \
+        "/usr/share/initramfs-tools/$_h.hook.disabled-by-panel"
+    done
+    if [ -f /etc/initramfs-tools/update-initramfs.conf ] && \
+       grep -q '^update_initramfs=yes' /etc/initramfs-tools/update-initramfs.conf; then
+      cp -a /etc/initramfs-tools/update-initramfs.conf \
+        /etc/initramfs-tools/update-initramfs.conf.panel-bak
+      sed -i 's/^update_initramfs=yes/update_initramfs=no/' \
+        /etc/initramfs-tools/update-initramfs.conf
+      ZQ_TOGGLED=1
+    fi
   fi
 
   dpkg --configure -a >/dev/null 2>&1 || true
@@ -136,7 +150,7 @@ pkg_install_debian() {
       git wget unzip opendkim opendkim-tools \
       python3 iproute2 curl ca-certificates net-tools openssl ) ) || rc=$?
 
-  # 恢复 initramfs 配置并补生成 initrd（坏 hook 已移走，可正常生成）
+  # 恢复 initramfs 配置并补生成 initrd
   if [ "$ZQ_TOGGLED" = "1" ]; then
     mv -f /etc/initramfs-tools/update-initramfs.conf.panel-bak \
       /etc/initramfs-tools/update-initramfs.conf
